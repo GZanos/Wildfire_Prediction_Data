@@ -1,0 +1,110 @@
+
+// Coordinates for the region of interest (ROI)
+var point = ee.Geometry.Point([28.4937, 36.9707]); // Replace with your coordinates
+
+// Date range for analysis
+var startDate = '2010-06-01';
+var endDate = '2023-02-28';
+
+// Load ERA5-Land dataset for relative humidity and wind component calculations
+var era5 = ee.ImageCollection('ECMWF/ERA5_LAND/MONTHLY')
+  .filterBounds(point)
+  .filterDate(startDate, endDate)
+  .select(['dewpoint_temperature_2m', 'temperature_2m', 'u_component_of_wind_10m', 'v_component_of_wind_10m']);
+
+// Calculate relative humidity using dewpoint and temperature
+var calculateRH = function(image) {
+  var temp = image.select('temperature_2m').subtract(273.15); // Convert Kelvin to Celsius
+  var dew = image.select('dewpoint_temperature_2m').subtract(273.15); // Convert Kelvin to Celsius
+  var rh = dew.expression(
+    '100 * exp((17.625 * dew) / (243.04 + dew)) / exp((17.625 * temp) / (243.04 + temp))',
+    {temp: temp, dew: dew}
+  );
+  return image.addBands(rh.rename('relative_humidity'));
+};
+
+// Apply the relative humidity calculation
+var era5WithRH = era5.map(calculateRH);
+
+// Extract time series for relative humidity
+var rhTimeSeries = era5WithRH.map(function(image) {
+  var date = ee.Date(image.get('system:time_start'));
+  var month = date.format('YYYY-MM');
+  var rh = image.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: point,
+    scale: 5000
+  }).get('relative_humidity');
+  return ee.Feature(null, {'month': month, 'relative_humidity': rh});
+});
+
+// Extract time series for u-component of wind (east-west)
+var uTimeSeries = era5.map(function(image) {
+  var date = ee.Date(image.get('system:time_start'));
+  var month = date.format('YYYY-MM');
+  var u = image.select('u_component_of_wind_10m').reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: point,
+    scale: 5000
+  }).get('u_component_of_wind_10m');
+  return ee.Feature(null, {'month': month, 'u_component': u});
+});
+
+// Extract time series for v-component of wind (north-south)
+var vTimeSeries = era5.map(function(image) {
+  var date = ee.Date(image.get('system:time_start'));
+  var month = date.format('YYYY-MM');
+  var v = image.select('v_component_of_wind_10m').reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: point,
+    scale: 5000
+  }).get('v_component_of_wind_10m');
+  return ee.Feature(null, {'month': month, 'v_component': v});
+});
+
+// Print the time series for relative humidity
+print('Relative Humidity Time Series', rhTimeSeries);
+
+// Print the time series for u-component of wind
+print('U-component Wind Time Series', uTimeSeries);
+
+// Print the time series for v-component of wind
+print('V-component Wind Time Series', vTimeSeries);
+
+// Plot the relative humidity time series
+var chartRH = ui.Chart.feature.byFeature(rhTimeSeries, 'month', 'relative_humidity')
+  .setOptions({
+    title: 'Relative Humidity Over Time',
+    hAxis: {title: 'Month'},
+    vAxis: {title: 'Relative Humidity (%)'},
+    lineWidth: 1,
+    pointSize: 2,
+    colors: ['blue']
+  });
+
+// Plot the u-component wind time series
+var chartU = ui.Chart.feature.byFeature(uTimeSeries, 'month', 'u_component')
+  .setOptions({
+    title: 'U-component of Wind (East-West) Over Time',
+    hAxis: {title: 'Month'},
+    vAxis: {title: 'U-component (m/s)'},
+    lineWidth: 1,
+    pointSize: 2,
+    colors: ['red']
+  });
+
+// Plot the v-component wind time series
+var chartV = ui.Chart.feature.byFeature(vTimeSeries, 'month', 'v_component')
+  .setOptions({
+    title: 'V-component of Wind (North-South) Over Time',
+    hAxis: {title: 'Month'},
+    vAxis: {title: 'V-component (m/s)'},
+    lineWidth: 1,
+    pointSize: 2,
+    colors: ['green']
+  });
+
+// Print the charts
+print(chartRH);
+print(chartU);
+print(chartV);
