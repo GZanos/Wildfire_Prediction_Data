@@ -1,0 +1,234 @@
+# Load necessary libraries
+library(keras)
+library(tensorflow)
+library(dplyr)
+library(tidyr)
+library(DMwR)
+library(dtw)
+library(caret)
+
+# Load dataset
+data <- read.csv("CAN1.csv")
+data$time <- as.numeric(data$time)
+
+# Normalize function
+normalize <- function(x) (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+
+# Normalize separately for each class
+features <- c("NDVI", "EVI", "LST", "RH", "EWW", "NSW")
+minority_class <- data %>% filter(Class == 1) %>% mutate(across(all_of(features), normalize))
+majority_class <- data %>% filter(Class == 0) %>% mutate(across(all_of(features), normalize))
+data_norm <- bind_rows(minority_class, majority_class)
+data_norm$Class <- as.factor(data$Class)
+
+# Compute centroids
+minority_class_matrix <- data_norm %>% filter(Class == 1) %>% select(-Class)
+X_center <- colMeans(minority_class_matrix, na.rm = TRUE)
+
+# Compute WPD
+compute_WPD <- function(Xi, X_center) {
+  alignment <- dtw(as.numeric(Xi), X_center, distance.only = TRUE)
+  return(alignment$normalizedDistance)
+}
+wpd_values <- apply(minority_class_matrix, 1, compute_WPD, X_center = X_center)
+WPD_average <- mean(wpd_values, na.rm = TRUE)
+
+# Generate synthetic samples
+safe_points <- minority_class_matrix[wpd_values < WPD_average, ]
+generate_synthetic_samples <- function(X_safe, X_center, num_samples) {
+  new_samples <- matrix(nrow = num_samples, ncol = ncol(X_safe))
+  for (i in seq_len(num_samples)) {
+    rand_factor <- runif(1, 0, 1)
+    X_safe_sample <- as.numeric(X_safe[sample(nrow(X_safe), 1), ])
+    new_samples[i, ] <- X_center + rand_factor * (X_safe_sample - X_center)
+  }
+  new_samples <- as.data.frame(new_samples)
+  colnames(new_samples) <- colnames(X_safe)
+  return(new_samples)
+}
+synthetic_data <- generate_synthetic_samples(safe_points, X_center, 20)
+synthetic_data$Class <- factor(1)
+data <- bind_rows(data_norm, synthetic_data)
+
+# Create sequences
+seq_length <- 12
+create_sequences <- function(data, seq_length) {
+  X <- list()
+  y <- c()
+  for (i in seq_len(nrow(data) - seq_length)) {
+    X[[i]] <- as.matrix(data[i:(i + seq_length - 1), -ncol(data)])
+    y[i] <- as.numeric(data$Class[i + seq_length])
+  }
+  X <- array(unlist(X), dim = c(length(X), seq_length, ncol(data) - 1))
+  return(list(X = X, y = y))
+}
+sequences <- create_sequences(data, seq_length)
+X <- sequences$X
+y <- sequences$y
+y <- y - 1
+
+
+# Function to evaluate models and return performance metrics
+evaluate_model <- function(model, X, y) {
+  predictions <- predict(model, X)
+  predicted_probabilities <- 1 / (1 + exp(-predictions))  # Apply sigmoid transformation
+  
+  # Initialize variables to store the best performance metrics
+  best_threshold <- 0
+  best_f1_score <- 0
+  best_sensitivity <- 0
+  best_specificity <- 0
+  best_mcc <- 0
+  best_accuracy <- 0
+  target_acc <- 0.6001
+  
+  # Loop over thresholds with increments of 0.0001 (4 decimals)
+  for (threshold in seq(0, 1, by = 0.0001)) {
+    predicted_classes <- ifelse(predicted_probabilities > threshold, 1, 0)
+    
+    # Compute confusion matrix
+    cm <- table(Predicted = predicted_classes, Actual = y)
+    
+    # Extract values from confusion matrix
+    TP <- ifelse("1" %in% rownames(cm) & "1" %in% colnames(cm), cm["1","1"], 0)
+    TN <- ifelse("0" %in% rownames(cm) & "0" %in% colnames(cm), cm["0","0"], 0)
+    FP <- ifelse("1" %in% rownames(cm) & "0" %in% colnames(cm), cm["1","0"], 0)
+    FN <- ifelse("0" %in% rownames(cm) & "1" %in% colnames(cm), cm["0","1"], 0)
+    
+    # Calculate performance metrics
+    sensitivity <- ifelse((TP + FN) == 0, 0, TP / (TP + FN))
+    specificity <- ifelse((TN + FP) == 0, 0, TN / (TN + FP))
+    precision <- ifelse((TP + FP) == 0, 0, TP / (TP + FP))
+    recall <- sensitivity
+    F1 <- ifelse((precision + recall) == 0, 0, 2 * ((precision * recall) / (precision + recall)))
+    MCC <- ifelse(sqrt((TP + FP) * (TP + FN) * (TN + FP) * (TN + FN)) == 0, 0,
+                  (TP * TN - FP * FN) / sqrt((TP + FP) * (TP + FN) * (TN + FP) * (TN + FN)))
+    accuracy <- ifelse(sum(cm) == 0, 0, (TP + TN) / sum(cm))
+    
+    # Update the best threshold if the current F1 score is better
+    if (accuracy > target_acc) {
+      best_f1_score <- F1
+      best_sensitivity <- sensitivity
+      best_specificity <- specificity
+      best_mcc <- MCC
+      best_accuracy <- accuracy
+      best_threshold <- threshold
+    }
+  }
+  
+  predictions_df <- data.frame(Actual = y, Predicted_Probability = predicted_probabilities, Predicted_Class = predicted_classes)
+  write.csv(predictions_df, paste0(model_name, "_predictions.csv"), row.names = FALSE)
+  
+  
+  # Return the best results
+  return(list(sensitivity = sensitivity, specificity = specificity, F1 = F1, MCC = MCC, accuracy = accuracy))
+}
+
+
+# Create an empty results data frame
+results <- data.frame(
+  model_name = character(),
+  activation_function = character(),
+  units = integer(),
+  batch_size = integer(),
+  sensitivity = numeric(),
+  specificity = numeric(),
+  F1 = numeric(),
+  MCC = numeric(),
+  accuracy = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Hyperparameter grid search
+for (activation_function in c("sigmoid", "tanh")) {  # GC2: as per 20/03 meeting, we set these values
+  for (units in c(90)) {  # GC2: as per 20/03 meeting, we set these values
+    for (epochs in c(150)) {  # GC2: as per 20/03 meeting, I found the optimal number by running a single LSTM/CRM code and looking at the graph
+      for (batch_size in c(16)) {  # GC2: as per 20/03 meeting, we set these values
+        for (validation_split in c(0.1)) {  # GC2: as per 20/03 meeting, we only need one value here
+          
+          cat("Running LSTM and CRM with activation:", activation_function, 
+              "units:", units, "epochs:", epochs, 
+              "batch_size:", batch_size, "validation_split:", validation_split, "\n")
+          
+          # Build and train LSTM model
+          lstm_model <- keras_model_sequential() %>%
+            layer_lstm(units = units, return_sequences = TRUE, input_shape = c(seq_length, ncol(data) - 1)) %>%
+            layer_dropout(rate = 0.2) %>%
+            layer_lstm(units = max(1, units / 2)) %>%
+            layer_dropout(rate = 0.2) %>%
+            layer_dense(units = 1, activation = activation_function)  
+          
+          lstm_model %>% compile(optimizer = "adam", loss = "binary_crossentropy", metrics = c("accuracy"))
+          
+          lstm_model %>% fit(
+            X, y, epochs = epochs, batch_size = batch_size, 
+            validation_split = validation_split, verbose = 0,
+            callbacks = list(
+              callback_early_stopping(monitor = "val_loss", restore_best_weights = TRUE, patience = 15),
+              callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.5, patience = 10, min_lr = 1e-6)
+            )
+          )
+          
+          # Build and train CRM model
+          crm_model <- keras_model_sequential() %>%
+            layer_lstm(units = units * 2, return_sequences = TRUE, input_shape = c(seq_length, ncol(data) - 1)) %>%
+            layer_dropout(rate = 0.2) %>%
+            layer_lstm(units = units, return_sequences = TRUE) %>%
+            layer_dropout(rate = 0.2) %>%
+            layer_lstm(units = max(1, units / 2)) %>%
+            layer_dropout(rate = 0.2) %>%
+            layer_dense(units = 1, activation = activation_function)  
+          
+          crm_model %>% compile(optimizer = "adam", loss = "binary_crossentropy", metrics = c("accuracy"))
+          
+          crm_model %>% fit(
+            X, y, epochs = epochs, batch_size = batch_size, 
+            validation_split = validation_split, verbose = 0,
+            callbacks = list(
+              callback_early_stopping(monitor = "val_loss", restore_best_weights = TRUE, patience = 15),
+              callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.5, patience = 10, min_lr = 1e-6)
+            )
+          )
+          
+          # Evaluate models
+          lstm_results <- evaluate_model(lstm_model, X, y)
+          crm_results <- evaluate_model(crm_model, X, y)
+          
+          # Store LSTM results
+          results <- rbind(results, data.frame(
+            model_name = "LSTM",
+            activation_function = activation_function,
+            units = units,
+            batch_size = batch_size,
+            sensitivity = lstm_results$sensitivity,
+            specificity = lstm_results$specificity,
+            F1 = lstm_results$F1,
+            MCC = lstm_results$MCC,
+            accuracy = lstm_results$accuracy
+          ))
+          
+          # Store CRM results
+          results <- rbind(results, data.frame(
+            model_name = "CRM",
+            activation_function = activation_function,
+            units = units,
+            batch_size = batch_size,
+            sensitivity = crm_results$sensitivity,
+            specificity = crm_results$specificity,
+            F1 = crm_results$F1,
+            MCC = crm_results$MCC,
+            accuracy = crm_results$accuracy
+          ))
+          
+          # Clear memory
+          k_clear_session()
+          gc()
+        }
+      }
+    }
+  }
+}
+
+# Save all results to a single CSV file
+write.csv(results, "model_performance_results.csv", row.names = FALSE)
+
