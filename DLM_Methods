@@ -139,12 +139,12 @@ results <- data.frame(
   stringsAsFactors = FALSE
 )
 
-# Hyperparameter grid search
-for (activation_function in c("sigmoid", "tanh")) {  # GC2: as per 20/03 meeting, we set these values
-  for (units in c(90)) {  # GC2: as per 20/03 meeting, we set these values
-    for (epochs in c(150)) {  # GC2: as per 20/03 meeting, I found the optimal number by running a single LSTM/CRM code and looking at the graph
-      for (batch_size in c(16)) {  # GC2: as per 20/03 meeting, we set these values
-        for (validation_split in c(0.1)) {  # GC2: as per 20/03 meeting, we only need one value here
+# Hyperparameter grid search (now set to random values, but please enter relevant limits required for tuning)
+for (activation_function in c("sigmoid", "tanh")) {  
+  for (units in c(90)) {  
+    for (epochs in c(150)) { 
+      for (batch_size in c(16)) {  
+        for (validation_split in c(0.1)) {  
           
           cat("Running LSTM and CRM with activation:", activation_function, 
               "units:", units, "epochs:", epochs, 
