@@ -104,7 +104,7 @@ doTS_FBLR <- function(data, freq = 12, burnIn = 500, adapt = 500, numChain = 2, 
   x <- data %>% select(-all_of(RV_name))
   
   # Remove 'time' and 'season' from standardization process
-  exclude_vars <- "time" # GC3: this ensures time is not scaled
+  exclude_vars <- "time" 
   x_to_scale <- x %>% select(-any_of(exclude_vars))
   x_not_scaled <- x %>% select(any_of(exclude_vars))
 
@@ -117,56 +117,28 @@ doTS_FBLR <- function(data, freq = 12, burnIn = 500, adapt = 500, numChain = 2, 
   har. <- harmonic(data1, 1)
   cosEffect <- har.[,1]
   sinEffect <- har.[,2]
-  
-  # GC3: from 27/02 meet - scale the harmonics
   sinEffect <- as.numeric(scale(sinEffect))
   cosEffect <- as.numeric(scale(cosEffect))
-  
-  # GC3: input the harmonics in zx so they work as features
+
   zx <- cbind(zx, sinEffect, cosEffect)
-  
-  # GC3: convert the time feature into continuous
   time_element <- time(data1)
   zx[, "time"] <- time_element
-  zx <- zx[, c(setdiff(names(zx), "time"), "time")] #GC3: ensures time is last column
-  
-  # GC3: we can also try scaling time (comment out the below line to not scale time)
-  zx[, "time"] <- scale(zx[, "time"])
-                        
-  # GC3: zx must be matrix for GFN operations to work
+  zx <- zx[, c(setdiff(names(zx), "time"), "time")] 
+  zx[, "time"] <- scale(zx[, "time"])                  
   zx <- as.matrix(zx)
   
-  # GC3: healthcheck for finite values in zx and y
+  # healthcheck for finite values in zx and y
   if (any(!is.finite(y))) stop("All y values must be finite.")
   if (any(!is.finite(zx))) stop("All x values must be finite.")
 
-  # HD1: Why not scale()?
   # zzx <- scale(x)
   # zx - zzx
-  # HD1: no need to standardise time and season. Is there any specific reason for the?
-  # HD1: Also you got harmnoic before standardisation.
-  # GC2: good points, thanks :) I moved harmonic analysis to use zx after standardization.
-  # GC2: also, I used a scale() function and removed season and time from standardization process.
-  # HD2: All good.
-  # GC3: thanks :)
-  
-  # HD1: You got cosEffect and sinEffect above. Why don't you use them and calculate seasonEffect below?
-  # HD1: seasonEffect is the same as cosEffect.
-  # HD1: sum(seasonEffect - cosEffect) = 1.509164e-13
-  # GC2: my bad, makes sense. I did it twice for no reason and the seasonEffect was wrong.
-  # GC2: what if we input sinEffect and cosEffect into the data list directly and use them that way?
-  # GC2: see changes below.
-  # HD2: Yep, it is best to input sinEffect and cosEffect into the data list directly and use them that way.
-  # GC3: thanks :)
-  
   
   # JAGS data
   x_mean <- colMeans(x)  # Mean of each predictor
   x_sd <- apply(x, 2, sd)  # SD of each predictor
     x_sd[x_sd == 0] <- 1
-  
-  # GC3: removed cosEffect and sinEffect, since these are now scaled features within zx
-  # GC3: also removed xm and xsd, since we do not do back-transformation any more
+
   dataList <- list(
     zx = zx,
     y = y,
@@ -176,14 +148,6 @@ doTS_FBLR <- function(data, freq = 12, burnIn = 500, adapt = 500, numChain = 2, 
   )
   
   
-  # Notes of 13/02 meeting:
-  #*: calculate these sin and cos outside of JAGS for greater efficiency, then input as variables.
-  #*: also take the k/6 part outside at the bottom of JAGS.
-  #*: install TSA package and use ts function to create seasonal time series. 
-  #*: Then run harmonic function to find cos and sin, then input into JAGS, instead of calcuating within.
-  #*: Use acf function to find the right frequency to use.
-  #*GC1: I did all of these changes, removing the calcs from JABS. Efficiency improves by 26%!
-  
   # JAGS model
   modelString <- "
     # Model
@@ -191,18 +155,7 @@ doTS_FBLR <- function(data, freq = 12, burnIn = 500, adapt = 500, numChain = 2, 
 
         for (i in 1:Ntotal) {
             # Logistic regression with seasonality
-            # HD1: Here your model is missing sin component of harmonic model.
-            # HD1: seasonEffect does not have a coefficient in the model.
-            # HD1: The model should have cosEffect and sinEffect and they shouldbe multiplied by coefficients like the other features.
-            # GC2: so inputing cosEffect and sinEffect instead of seasonEffect, we can then do the m[i] below this way?
-            # HD2: Yes, that's right.
-            # GC3: Cheers :)
             
-            # HD2: Why do you have season as a fetuure in your model? Seasonality is already captured by harmonic coefficients. 
-            # GC3: Then, we can drop. It was selected as part of feature selection, but we can use your logic here on the paper and remove.
-            # GC3: The 'season' feature has been removed.
-            
-            # GC3: from 27/02 meeting, since cos and sin effects are now scaled features within zx, we remove from model
             m[i] <- guess * 0.5 + (1 - guess) * ilogit(
                 zbeta0 
                 + sum(zbeta[1:Nx] * zx[i, 1:Nx]) 
@@ -212,11 +165,7 @@ doTS_FBLR <- function(data, freq = 12, burnIn = 500, adapt = 500, numChain = 2, 
 
         # Priors
         guess ~ dbeta(1, 4) 
-        # HD2: You can play with the parameters of dbeta() to see if it helps with large betas. 
-        # HD2: As you increase the mean of this prior, more instances will be coming from a random guess.
-        # GC3: from 27/02 meeting - we keep as (1,4) but can try to make the 2nd value even smaller.
-        
-        
+   
         zbeta0 ~ dnorm(0, 0.25)
         
         for (j in 1:Nx) {
@@ -227,23 +176,13 @@ doTS_FBLR <- function(data, freq = 12, burnIn = 500, adapt = 500, numChain = 2, 
         # Hyperprior for lambda
         lambda ~ dgamma(0.1, 0.1)
         
-        # GC3: since cos and sin effects are scaled features within zx, we do not need to call their priors
-
         # Priors for harmonic coefficients
-        # HD1: Your model does not have sin and cos coefficients. They must appear in the model.
-        # GC2: I added them above. Is it correct way?
-        # HD2: Yep.
-        # GC3: Cheers :)
+        
         #zsinBeta ~ dnorm(0, 0.25)
         #zcosBeta ~ dnorm(0, 0.25)
         
-        
-        # GC3: since cos and sin effects are scaled features within zx, we do not need to back-transform. We will work with zx and zbeta instead.
-        
         # Transform to original scale:
-        # GC2: is this what you mean on 255-262 comments? add it on here?
-        # HD2: Yep.
-        # GC3: Cheers :)
+       
         #for (j in 1:(Nx-1)) {
         #        beta[j] <- zbeta[j] / xsd[j]
         #        }
@@ -256,8 +195,6 @@ doTS_FBLR <- function(data, freq = 12, burnIn = 500, adapt = 500, numChain = 2, 
   
   # Run JAGS model
   parameters <- c("zbeta0", "zbeta") # GC3: we only work with zbetas now, as per FBLR process too
-  
-  # HD2: You need to send the number of MCMC samples
   
   numSavedSteps = SavedSteps # HD2: This can be another argument of the function / GC3: added as function input
   numChain = numChain # HD2: No need to have 4 chains for such a simple model / #GC3: added 2 in function input
@@ -280,18 +217,15 @@ doTS_FBLR <- function(data, freq = 12, burnIn = 500, adapt = 500, numChain = 2, 
   model_summary <- summary(runJagsOut)
   #print(model_summary) 
   
-  # HD1: Added
-  # GC2: temporarily commented out as it was giving errors. I need to fix. 
   Nx <- dim(zx)[2]
   diagMCMC( codaSamples , parName="zbeta0" )
-  for ( i in 1:Nx){ # HD1: +2 are harmonic coefficients.# HD2: Modified this as you have different names for harmonic coefficients.
+  for ( i in 1:Nx){ # HD1: +2 are harmonic coefficients.
    diagMCMC( codaSamples , parName=paste0("zbeta[",i,"]") )
   }
-  # GC3: since sin and cos effects are zbetas now, the below 2 lines not needed
+
   #diagMCMC( codaSamples , parName="sinBeta" )
   #diagMCMC( codaSamples , parName="cosBeta" )
   graphics.off()
-  # HD1: Added
   
   # Dynamically determine indices for beta parameters
   start_index <- which(rownames(model_summary) == "zbeta0")
@@ -299,19 +233,10 @@ doTS_FBLR <- function(data, freq = 12, burnIn = 500, adapt = 500, numChain = 2, 
   end_index <- start_index + Nx 
   
   # Extract beta statistics dynamically
-  # HD1: These are not posterior estimates of beta parameters. They are zbetas.
-  # GC2: Yep, mistake on my part! Did not include the additional parameters before running the JAGS... fixed it now.
-  
-  # HD1: JAGS model does not convert zbetas to betas. 
-  # HD1: You need to do this conversion in the JAGS model text. 
-  # HD1: And then get the posterior estimates of beta parameters here.
-  # GC2: I added the code to transform the betas within JAGS (lines 211-216).
-  # GC2: But if we look at the SD values for some of these 'betas', some are super large, which cause NaN/Inf values on GFN.probabilities
-  # GC3: from 27/02 meet - we will work with zbetas and zx instead, which is already scaled
-  
+ 
   #print(model_summary)
   
-  # GC2: Extract median and SD of beta values. This way, we include sinBeta and cosBeta as GFNs.
+  # Extract median and SD of beta values. This way, we include sinBeta and cosBeta as GFNs.
   beta_indices <- grep("^zbeta", rownames(model_summary)) 
   beta_means <- model_summary[beta_indices, "Median"]
   beta_sd <- model_summary[beta_indices, "SD"]
@@ -322,7 +247,6 @@ doTS_FBLR <- function(data, freq = 12, burnIn = 500, adapt = 500, numChain = 2, 
     gaussian_fuzzy_matrix[i, ] <- c(beta_means[i], beta_sd[i])
   }
   print(gaussian_fuzzy_matrix)
-  # GC3: coefficient values are much smaller, great!
   
 
   ## GFN Logistic Function -- GFN/Crisp Operations Method ##
@@ -346,11 +270,6 @@ doTS_FBLR <- function(data, freq = 12, burnIn = 500, adapt = 500, numChain = 2, 
   if (any(is.na(GFN.probabilities))) {
     stop("Error: GFN.probabilities contains NA values!")
   }
-  
-  # GC3: but still getting NaN / Inf values for GFN.probabilities
-  # GC3: maybe we should try to scale time too ....
-  # GC3: well this is funny..... I scaled "time" (see line 134) and getting perfect results!!! Works amazing.... :D
- 
   
   ## Classification with Tau optimization to chase desired performance outcome ##
   # Function for performance measures
@@ -447,7 +366,6 @@ doTS_FBLR <- function(data, freq = 12, burnIn = 500, adapt = 500, numChain = 2, 
 
 
 # Import data
-#setwd("~/Documents/MATH800/George/paper6_bushfires/TS-FBLR/VIC1") # HD1: Added
 source("DBDA2E-utilities.R")   # HD1: Added
 data <- read.csv("TUR1.csv")
 
@@ -459,8 +377,3 @@ har. <- harmonic(data1, 1)
 # Run TS_FBLR
 results <- doTS_FBLR(data)
 
-
-#For benchmarking:
-#*: Comparison cannot be against classical ML or other such methods. Instead:
-#*: find deep learning models that can handle seasonality to compare against - LSTM or CRM
-#*: but first, let's lock in this code, then I will find and run those methods
