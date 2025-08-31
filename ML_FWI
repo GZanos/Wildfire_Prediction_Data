@@ -1,0 +1,438 @@
+# ==================================================================
+# 1. Load libraries
+# ==================================================================
+# install.packages(c("cffdrs","MASS","lubridate","mgcv","pscl","pROC","dplyr","tidyr","DMwR2","dtw","caret"), dependencies=TRUE)
+
+library(cffdrs)      # FWI system
+library(MASS)        # glm.nb
+library(lubridate)   # date handling
+library(mgcv)        # cyclic GAM
+library(pscl)        # ZINB
+library(pROC)        # ROC curves
+library(dplyr)
+library(tidyr)
+library(DMwR)       # maintained fork of DMwR
+library(dtw)
+library(caret)
+
+# ==================================================================
+# 2. Import data
+# ==================================================================
+df <- read.csv("GRE1.csv", stringsAsFactors = FALSE)
+
+# Expecting columns: time (1-12), NDVI, EVI, LST, Humidity, EW_Wind, NS_Wind, Class
+stopifnot(all(c("time","NDVI","EVI","LST","Humidity","EW_Wind","NS_Wind","Class") %in% names(df)))
+
+# Coerce types defensively
+df <- df %>%
+  mutate(
+    time     = as.numeric(time),
+    Class    = as.integer(Class),
+    NDVI     = as.numeric(NDVI),
+    EVI      = as.numeric(EVI),
+    LST      = as.numeric(LST),
+    Humidity = as.numeric(Humidity),
+    EW_Wind  = as.numeric(EW_Wind),
+    NS_Wind  = as.numeric(NS_Wind)
+  )
+
+# ==================================================================
+# 3. Preprocess inputs (on original scale)
+# ==================================================================
+df <- df %>%
+  mutate(
+    # seasonality (use the column name directly!)
+    sin_time = sin(2 * pi * time / 12),
+    cos_time = cos(2 * pi * time / 12)
+  )
+str(df)
+
+# ==================================================================
+# 4. Compute Monthly FWI for original rows
+# ==================================================================
+# Wind speed km/h
+df$wind_kmh <- sqrt(df$EW_Wind^2 + df$NS_Wind^2) * 3.6
+
+# Dummy monthly dates for FWI (month driven by 'time')
+# map each row's 'time' (1..12) to a date in a fixed year
+df$date <- as.Date(sprintf("2010-%02d-01", pmax(1, pmin(12, round(df$time)))))
+
+# Precip (0 if not available)
+df$r <- if ("Precip_mm" %in% names(df)) df$Precip_mm else 0
+
+# Build the required input for fwi()
+fwi_input <- data.frame(
+  temp = df$LST,              # your LST in °C
+  rh   = df$Humidity,         # relative humidity %
+  ws   = df$wind_kmh,         # wind speed km/h
+  prec = df$r,                # precipitation mm
+  lat  = 0,                   # dummy (required if missing)
+  lon  = 0,                   # dummy (required if missing)
+  yr   = 2010                 # or any constant year
+)
+
+# Run FWI
+fwi_out <- fwi(fwi_input)
+
+# Attach FWI back to your main df
+df$FWI <- fwi_out$FWI
+
+
+# ==================================================================
+# 5. SMOTE-TS style oversampling (scale-only for synthesis)
+# ==================================================================
+# We'll scale only to generate synthetic samples, then denormalize back.
+
+features <- c("NDVI", "EVI", "LST", "Humidity", "EW_Wind", "NS_Wind", "FWI")
+
+# Min/Max from original data for denormalization later
+feat_min <- sapply(df[features], function(x) min(x, na.rm = TRUE))
+feat_max <- sapply(df[features], function(x) max(x, na.rm = TRUE))
+
+normalize   <- function(x, mn, mx) (x - mn) / (mx - mn)
+denormalize <- function(z, mn, mx) (z * (mx - mn)) + mn
+
+# Build scaled copies ONLY for synthesis
+df_scaled <- df
+for (nm in features) {
+  df_scaled[[nm]] <- normalize(df[[nm]], feat_min[[nm]], feat_max[[nm]])
+}
+
+# Split by class (scaled)
+minority_scaled <- df_scaled %>% filter(Class == 1)
+majority_scaled <- df_scaled %>% filter(Class == 0)
+
+# Compute centroid of minority (scaled space)
+minority_matrix <- minority_scaled %>% select(all_of(features))
+X_center <- colMeans(minority_matrix, na.rm = TRUE)
+
+# Weighted Path Distance (DTW over feature vector)
+# (Vectors have same length; dtw acts like an elastic distance here)
+compute_WPD <- function(Xi, X_center) {
+  alignment <- dtw(as.numeric(Xi), X_center, distance.only = TRUE)
+  alignment$normalizedDistance
+}
+wpd_values   <- apply(minority_matrix, 1, compute_WPD, X_center = X_center)
+WPD_average  <- mean(wpd_values, na.rm = TRUE)
+
+# Safe points (scaled)
+safe_points_scaled <- minority_matrix[wpd_values < WPD_average, , drop = FALSE]
+
+# Generate synthetic samples in SCALED space
+generate_synthetic_samples_scaled <- function(X_safe, X_center, num_samples) {
+  if (nrow(X_safe) == 0) stop("No safe points found to synthesize from.")
+  new_samples <- matrix(nrow = num_samples, ncol = ncol(X_safe))
+  for (i in seq_len(num_samples)) {
+    rand_factor   <- runif(1, 0, 1)
+    X_safe_sample <- as.numeric(X_safe[sample(nrow(X_safe), 1), ])
+    new_samples[i, ] <- X_center + rand_factor * (X_safe_sample - X_center)
+  }
+  new_samples <- as.data.frame(new_samples)
+  colnames(new_samples) <- colnames(X_safe)
+  new_samples
+}
+
+num_synth <- 50
+synthetic_scaled <- generate_synthetic_samples_scaled(safe_points_scaled, X_center, num_synth)
+
+# Denormalize synthetic samples back to ORIGINAL units
+synthetic_denorm <- synthetic_scaled
+for (nm in features) {
+  synthetic_denorm[[nm]] <- denormalize(synthetic_scaled[[nm]], feat_min[[nm]], feat_max[[nm]])
+}
+
+# Assign labels and additional required fields for synthetic rows
+# (time sampled from minority distribution for realism)
+set.seed(123)
+time_pool <- df %>% filter(Class == 1) %>% pull(time)
+if (length(time_pool) == 0) stop("No minority class rows found to sample 'time' from.")
+
+synthetic_denorm$Class <- 1L
+synthetic_denorm$time  <- sample(time_pool, num_synth, replace = TRUE)
+
+# Recompute wind_kmh on ORIGINAL scale from denormalized EW/NS
+synthetic_denorm$wind_kmh <- sqrt(synthetic_denorm$EW_Wind^2 + synthetic_denorm$NS_Wind^2) * 3.6
+
+# Create dates consistent with assigned month
+synthetic_denorm$date <- as.Date(sprintf("2010-%02d-01", pmax(1, pmin(12, round(synthetic_denorm$time)))))
+
+# Precip set to 0 unless you have something else
+synthetic_denorm$r <- 0
+
+# Recompute FWI using ORIGINAL units for synthetic rows (overwrites the denorm FWI to be consistent)
+# Prepare synthetic input for FWI
+fwi_synth_input <- data.frame(
+  temp = synthetic_denorm$LST,       # temperature
+  rh   = synthetic_denorm$Humidity,  # relative humidity
+  ws   = synthetic_denorm$wind_kmh,  # wind speed km/h
+  prec = synthetic_denorm$r,         # precipitation mm
+  lat  = 0,                          # dummy latitude
+  lon  = 0,                          # dummy longitude
+  yr   = 2010                         # dummy year
+)
+
+# Run FWI on synthetic data
+fwi_synth_out <- fwi(fwi_synth_input)
+
+# Attach FWI values
+synthetic_denorm$FWI <- fwi_synth_out$FWI
+
+# Compute seasonality for synthetic rows
+synthetic_denorm <- synthetic_denorm %>%
+  mutate(
+    sin_time = sin(2 * pi * time / 12),
+    cos_time = cos(2 * pi * time / 12)
+  )
+
+# Keep only the columns we need to match df for binding
+keep_cols <- union(names(df), names(synthetic_denorm))
+df        <- df[, keep_cols[keep_cols %in% names(df)], drop = FALSE]
+synthetic_denorm <- synthetic_denorm[, keep_cols[keep_cols %in% names(synthetic_denorm)], drop = FALSE]
+
+# Final dataset after oversampling: original + synthetic (ALL on original scale)
+df_final <- bind_rows(df, synthetic_denorm)
+
+# ==================================================================
+# 6. Models on oversampled dataset
+# ==================================================================
+df_final <- df_final %>%
+  mutate(
+    # (optional) higher-order harmonics
+    sin2_time = sin(4 * pi * time / 12),
+    cos2_time = cos(4 * pi * time / 12),
+    actual    = ifelse(Class == 1, 1, 0)
+  )
+
+# Logistic occurrence model
+glm_occ <- glm(
+  actual ~ FWI + sin_time + cos_time + NDVI + EVI + LST + Humidity + wind_kmh,
+  family = binomial(link = "logit"),
+  data   = df_final
+)
+
+# Gamma GLM on positives
+df_pos <- subset(df_final, actual > 0)
+glm_size <- glm(
+  actual ~ FWI + sin_time + cos_time + NDVI + EVI + LST + Humidity + wind_kmh,
+  family = Gamma(link = "log"),
+  data   = df_pos
+)
+
+# Zero-Inflated Negative Binomial
+zinb_mod <- zeroinfl(
+  actual ~ FWI + sin_time + cos_time + NDVI + EVI + LST + Humidity + wind_kmh |
+    FWI + sin_time + cos_time,
+  data = df_final,
+  dist = "negbin"
+)
+
+# ==================================================================
+# 7. Evaluate performance
+# ==================================================================
+evaluate <- function(actual, predicted) {
+  TP <- sum(actual == 1 & predicted == 1)
+  TN <- sum(actual == 0 & predicted == 0)
+  FP <- sum(actual == 0 & predicted == 1)
+  FN <- sum(actual == 1 & predicted == 0)
+  Sensitivity <- if ((TP+FN)>0) TP / (TP + FN) else NA
+  Specificity <- if ((TN+FP)>0) TN / (TN + FP) else NA
+  Accuracy    <- (TP + TN) / (TP + TN + FP + FN)
+  Precision   <- if ((TP + FP) > 0) TP / (TP + FP) else NA
+  F1          <- if (!is.na(Precision) && (Precision + Sensitivity) > 0) 2 * Precision * Sensitivity / (Precision + Sensitivity) else NA
+  denom_mcc   <- sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN))
+  MCC         <- if (denom_mcc > 0) (TP*TN - FP*FN) / denom_mcc else NA
+  data.frame(Sensitivity, Specificity, Accuracy, F1, MCC)
+}
+
+# Predictions
+df_final$prob_occ      <- predict(glm_occ,   type = "response")
+df_final$pred_occ      <- ifelse(df_final$prob_occ > 0.5, 1, 0)
+
+df_final$score_gamma   <- predict(glm_size, newdata = df_final, type = "response")
+df_final$pred_gamma    <- ifelse(df_final$score_gamma > 0.5, 1, 0)
+
+prob0_zinb             <- predict(zinb_mod, type = "prob")[,1]
+df_final$prob_occ_zinb <- 1 - prob0_zinb
+df_final$pred_zinb     <- ifelse(df_final$prob_occ_zinb > 0.5, 1, 0)
+
+# Metrics
+metrics_occ   <- evaluate(df_final$actual, df_final$pred_occ)
+metrics_gamma <- evaluate(df_final$actual, df_final$pred_gamma)
+metrics_zinb  <- evaluate(df_final$actual, df_final$pred_zinb)
+
+# AUC
+roc_occ   <- roc(df_final$actual, df_final$prob_occ)
+roc_gamma <- roc(df_final$actual, df_final$score_gamma)
+roc_zinb  <- roc(df_final$actual, df_final$prob_occ_zinb)
+
+auc_occ   <- as.numeric(auc(roc_occ))
+auc_gamma <- as.numeric(auc(roc_gamma))
+auc_zinb  <- as.numeric(auc(roc_zinb))
+
+# Results
+cat("=== Classification Metrics (with SMOTE-TS) ===\n")
+cat("Logistic Occurrence Model:\n");   print(metrics_occ)
+cat("\nGamma‐GLM (thresholded) Model:\n"); print(metrics_gamma)
+cat("\nZero‐Inflated NB Model:\n");     print(metrics_zinb)
+
+cat("\n=== AUC (ROC) ===\n")
+cat(sprintf("Logistic Occurrence:           %0.3f\n", auc_occ))
+cat(sprintf("Gamma‐GLM (counts as score):   %0.3f\n", auc_gamma))
+cat(sprintf("Zero‐Inflated NB:              %0.3f\n", auc_zinb))
+
+
+# ==================================================================
+# 1. Load libraries
+# ==================================================================
+library(caret)
+library(e1071)         # SVM
+library(nnet)          # ANN
+library(randomForest)  # RF
+library(xgboost)       # XGBoost
+library(DMwR)          # SMOTE
+library(MLmetrics)     # F1, MCC
+library(dtw)           # Weighted Path Distance
+library(dplyr)         # data wrangling
+
+# ==================================================================
+# 2. Import data
+# ==================================================================
+data <- read.csv("VIC1.csv") 
+data$Class <- as.factor(data$Class)
+
+# Split into train/test (top 90% train, 10% test)
+split_index <- round(nrow(data) * 0.4)
+trainData <- data[1:split_index, ]
+testData  <- data[(split_index + 1):nrow(data), ]
+
+# Predictor names: all columns except the response
+predictors <- setdiff(names(data), "Class")
+response   <- "Class"
+
+# ==================================================================
+# 3. SMOTE-TS oversampling using WPD
+# ==================================================================
+normalize <- function(x) (x - min(x, na.rm=TRUE)) / (max(x, na.rm=TRUE) - min(x, na.rm=TRUE))
+train_norm <- trainData
+train_norm[predictors] <- lapply(train_norm[predictors], normalize)
+
+minority_matrix <- train_norm[train_norm$Class == 1, predictors] %>%
+  mutate(across(everything(), as.numeric))
+
+X_center <- colMeans(minority_matrix, na.rm = TRUE)
+
+compute_WPD <- function(Xi, X_center) {
+  Xi <- as.numeric(Xi)
+  X_center <- as.numeric(X_center)
+  if(length(Xi) < 2 || length(X_center) < 2 || all(is.na(Xi)) || all(is.na(X_center))) return(NA)
+  dtw(Xi, X_center, distance.only = TRUE)$normalizedDistance
+}
+
+wpd_values <- apply(minority_matrix, 1, function(x) compute_WPD(x, X_center))
+WPD_average <- mean(wpd_values, na.rm = TRUE)
+
+safe_points <- minority_matrix[wpd_values < WPD_average & !is.na(wpd_values), ]
+safe_points <- safe_points[complete.cases(safe_points), ]
+
+generate_synthetic_samples <- function(X_safe, X_center, num_samples) {
+  if(nrow(X_safe) == 0) return(data.frame())
+  new_samples <- matrix(nrow = num_samples, ncol = ncol(X_safe))
+  for (i in seq_len(num_samples)) {
+    rand_factor <- runif(1)
+    X_safe_sample <- as.numeric(X_safe[sample(nrow(X_safe), 1), ])
+    new_samples[i, ] <- X_center + rand_factor * (X_safe_sample - X_center)
+  }
+  new_samples <- as.data.frame(new_samples)
+  colnames(new_samples) <- colnames(X_safe)
+  return(new_samples)
+}
+
+synthetic_data <- generate_synthetic_samples(safe_points, X_center, 50)
+if(nrow(synthetic_data) > 0) synthetic_data$Class <- factor(1)
+
+train_final <- bind_rows(train_norm, synthetic_data)
+train_final <- train_final[complete.cases(train_final), ]
+cat("Number of NAs after SMOTE-TS fix:", sum(is.na(train_final)), "\n")
+
+# ==================================================================
+# 4. Train ML models
+# ==================================================================
+set.seed(123)
+models <- list()
+
+# Standard models use original predictors
+models$SVM_Radial   <- train(as.formula(paste(response, "~", paste(predictors, collapse = "+"))),
+                             data = trainData, method = "svmRadial")
+models$SVM_Linear   <- train(as.formula(paste(response, "~", paste(predictors, collapse = "+"))),
+                             data = trainData, method = "svmLinear")
+models$ANN          <- train(as.formula(paste(response, "~", paste(predictors, collapse = "+"))),
+                             data = trainData, method = "nnet", linout = FALSE, trace = FALSE)
+models$KNN          <- train(as.formula(paste(response, "~", paste(predictors, collapse = "+"))),
+                             data = trainData, method = "knn")
+models$RandomForest <- train(as.formula(paste(response, "~", paste(predictors, collapse = "+"))),
+                             data = trainData, method = "rf")
+models$XGBoost      <- train(as.formula(paste(response, "~", paste(predictors, collapse = "+"))),
+                             data = trainData, method = "xgbTree")
+
+# SMOTE-TS models use numeric columns of train_final
+numeric_predictors <- names(train_final)[sapply(train_final, is.numeric)]
+models$SMOTE_SVM_Radial <- train(as.formula(paste(response, "~", paste(numeric_predictors, collapse = "+"))),
+                                 data = train_final, method = "svmRadial")
+models$SMOTE_SVM_Linear <- train(as.formula(paste(response, "~", paste(numeric_predictors, collapse = "+"))),
+                                 data = train_final, method = "svmLinear")
+models$SMOTE_ANN        <- train(as.formula(paste(response, "~", paste(numeric_predictors, collapse = "+"))),
+                                 data = train_final, method = "nnet", linout = FALSE, trace = FALSE)
+models$SMOTE_KNN        <- train(as.formula(paste(response, "~", paste(numeric_predictors, collapse = "+"))),
+                                 data = train_final, method = "knn")
+models$SMOTE_RF         <- train(as.formula(paste(response, "~", paste(numeric_predictors, collapse = "+"))),
+                                 data = train_final, method = "rf")
+models$SMOTE_XGB        <- train(as.formula(paste(response, "~", paste(numeric_predictors, collapse = "+"))),
+                                 data = train_final, method = "xgbTree")
+
+# ==================================================================
+# 5. Evaluate models
+# ==================================================================
+results_df <- data.frame(Model = character(),
+                         Sensitivity = numeric(),
+                         Specificity = numeric(),
+                         F1 = numeric(),
+                         MCC = numeric(),
+                         TP = numeric(),
+                         TN = numeric(),
+                         FP = numeric(),
+                         FN = numeric(),
+                         stringsAsFactors = FALSE)
+
+for (model_name in names(models)) {
+  model <- models[[model_name]]
+  pred <- predict(model, testData)
+  
+  y_true <- as.numeric(as.character(testData$Class))
+  y_pred <- as.numeric(as.character(pred))
+  
+  cm <- confusionMatrix(pred, testData$Class)
+  
+  tp <- cm$table[2,2]
+  tn <- cm$table[1,1]
+  fp <- cm$table[1,2]
+  fn <- cm$table[2,1]
+  
+  sensitivity <- cm$byClass["Sensitivity"]
+  specificity <- cm$byClass["Specificity"]
+  f1 <- F1_Score(y_true = y_true, y_pred = y_pred)
+  mcc <- (tp * tn - fp * fn) / sqrt((tp + fp)*(tp + fn)*(tn + fp)*(tn + fn))
+  
+  results_df <- rbind(results_df, data.frame(Model = model_name,
+                                             Sensitivity = sensitivity,
+                                             Specificity = specificity,
+                                             F1 = f1,
+                                             MCC = mcc,
+                                             TP = tp,
+                                             TN = tn,
+                                             FP = fp,
+                                             FN = fn))
+}
+
+write.csv(results_df, "model_performance_metrics.csv", row.names = FALSE)
+cat("Pipeline completed. Metrics saved to model_performance_metrics.csv\n")
+
